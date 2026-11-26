@@ -86,8 +86,9 @@ st.title("Event Booking System")
 
 # ===================== BOOKING HELPER (used by the regular user) =====================
 # Status values written by the booking form. Change these if your tables use different codes.
-BOOKING_STATUS = "CONFIRMED"
-PAYMENT_STATUS = "PAID"
+BOOKING_STATUS = "PENDING"  # the database trigger sets it to CONFIRMED when a payment is inserted
+PAYMENT_STATUS = "COMPLETED"  # the trigger trg_payment_confirm_booking fires on this value
+CASH_PAYMENT_STATUS = "PENDING"  # cash is paid at the box office, so the booking stays PENDING until then
 TICKET_STATUS = "VALID"
 
 
@@ -119,12 +120,18 @@ def create_booking(name, phone, email, address, event_id, ticket_count, method, 
         )
         booking_id = cur.fetchone()[0]
 
-        # Payment record (the reference is optional and must be unique if given)
+        # Payment record (the reference is optional and must be unique if given).
+        # Cash is paid later at the box office, so it is saved as PENDING and the trigger does not confirm the booking.
+        payment_status = CASH_PAYMENT_STATUS if method == "CASH" else PAYMENT_STATUS
         cur.execute(
             "INSERT INTO payments (booking_id, payment_method_code, payment_amount, payment_date, payment_status, transaction_reference) "
             "VALUES (%s, %s, %s, NOW(), %s, %s)",
-            (booking_id, method, amount, PAYMENT_STATUS, reference or None),
+            (booking_id, method, amount, payment_status, reference or None),
         )
+
+        # Read back the booking status (the trigger on payments may have changed PENDING to CONFIRMED)
+        cur.execute("SELECT booking_status_code FROM customer_bookings WHERE booking_id = %s", (booking_id,))
+        final_status = cur.fetchone()[0]
 
         # One ticket per seat; the code is built from the event id, booking id and ticket number
         ticket_codes = []
@@ -137,7 +144,7 @@ def create_booking(name, phone, email, address, event_id, ticket_count, method, 
             ticket_codes.append(code)
 
         conn.commit()
-        return {"booking_id": booking_id, "ticket_codes": ticket_codes}
+        return {"booking_id": booking_id, "ticket_codes": ticket_codes, "status": final_status}
     except Exception as e:
         conn.rollback()
         st.error(f"Booking failed, nothing was saved: {e}")
@@ -162,7 +169,10 @@ if st.session_state["role"] == "user":
         confirmation = st.session_state.get("confirmation")
 
         if confirmation:
-            st.success("Your booking is confirmed!")
+            if confirmation["status"] == "CONFIRMED":
+                st.success("Your booking is confirmed!")
+            else:
+                st.info(f"Your booking was received and is awaiting payment. Status: {confirmation['status']}")
             st.subheader(f"Booking ID: {confirmation['booking_id']}")
             st.write(f"**Event:** {confirmation['event']}")
             st.write(f"**Name:** {confirmation['name']}")
@@ -212,6 +222,7 @@ if st.session_state["role"] == "user":
                             st.session_state["confirmation"] = {
                                 "booking_id": result["booking_id"],
                                 "ticket_codes": result["ticket_codes"],
+                                "status": result["status"],
                                 "event": user_event_labels[eid],
                                 "name": name.strip(),
                                 "email": email.strip(),
