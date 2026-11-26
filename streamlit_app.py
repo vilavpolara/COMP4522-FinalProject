@@ -84,6 +84,68 @@ if st.sidebar.button("Log out"):
 st.title("Event Booking System")
 
 
+# ===================== BOOKING HELPER (used by the regular user) =====================
+# Status values written by the booking form. Change these if your tables use different codes.
+BOOKING_STATUS = "CONFIRMED"
+PAYMENT_STATUS = "PAID"
+TICKET_STATUS = "VALID"
+
+
+# Create the customer (if new), booking, payment and tickets in ONE transaction.
+# If any step fails, nothing is saved. Returns the booking id and ticket codes, or None on failure.
+def create_booking(name, phone, email, address, event_id, ticket_count, method, amount, reference):
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+
+        # Reuse the customer if the email already exists, otherwise create a new customer
+        cur.execute("SELECT customer_id FROM customers WHERE LOWER(customer_email) = LOWER(%s)", (email,))
+        row = cur.fetchone()
+        if row:
+            customer_id = row[0]
+        else:
+            cur.execute(
+                "INSERT INTO customers (customer_name, customer_phone, customer_email, customer_address, customer_payment_method) "
+                "VALUES (%s, %s, %s, %s, %s) RETURNING customer_id",
+                (name, phone, email, address, method),
+            )
+            customer_id = cur.fetchone()[0]
+
+        # Booking (today's date and the event's start time are filled in automatically)
+        cur.execute(
+            "INSERT INTO customer_bookings (customer_id, event_id, booking_status_code, event_datetime, booking_made_date, booking_seat_count) "
+            "VALUES (%s, %s, %s, (SELECT event_start_date FROM events WHERE event_id = %s), CURRENT_DATE, %s) RETURNING booking_id",
+            (customer_id, event_id, BOOKING_STATUS, event_id, ticket_count),
+        )
+        booking_id = cur.fetchone()[0]
+
+        # Payment record (the reference is optional and must be unique if given)
+        cur.execute(
+            "INSERT INTO payments (booking_id, payment_method_code, payment_amount, payment_date, payment_status, transaction_reference) "
+            "VALUES (%s, %s, %s, NOW(), %s, %s)",
+            (booking_id, method, amount, PAYMENT_STATUS, reference or None),
+        )
+
+        # One ticket per seat; the code is built from the event id, booking id and ticket number
+        ticket_codes = []
+        for n in range(1, ticket_count + 1):
+            code = f"TKT-E{event_id:02d}-B{booking_id:03d}-{n:02d}"  # same pattern as the existing tickets
+            cur.execute(
+                "INSERT INTO tickets (booking_id, ticket_code, ticket_status, ticket_issue_date) VALUES (%s, %s, %s, NOW())",
+                (booking_id, code, TICKET_STATUS),
+            )
+            ticket_codes.append(code)
+
+        conn.commit()
+        return {"booking_id": booking_id, "ticket_codes": ticket_codes}
+    except Exception as e:
+        conn.rollback()
+        st.error(f"Booking failed, nothing was saved: {e}")
+        return None
+    finally:
+        conn.close()
+
+
 # ===================== REGULAR USER (view Events and Venues, make a booking) =====================
 if st.session_state["role"] == "user":
     choice = st.sidebar.radio("Page", ["Events", "Venues", "Make a booking"])
@@ -95,34 +157,68 @@ if st.session_state["role"] == "user":
     elif choice == "Venues":
         st.dataframe(read_data("SELECT * FROM venues ORDER BY venue_id"), use_container_width=True)
 
-    # Single booking form (insert only: the user cannot see, edit or delete bookings)
+    # Booking page: confirmation screen after a successful booking, otherwise the single booking form
     else:
-        user_events = read_data("SELECT event_id, event_name, event_start_date FROM events ORDER BY event_id")
-        user_event_labels = {e["event_id"]: f"{e['event_name']} ({e['event_start_date']})" for e in user_events}
+        confirmation = st.session_state.get("confirmation")
 
-        if not user_events:
-            st.info("There are no events available to book yet.")
+        if confirmation:
+            st.success("Your booking is confirmed!")
+            st.subheader(f"Booking ID: {confirmation['booking_id']}")
+            st.write(f"**Event:** {confirmation['event']}")
+            st.write(f"**Name:** {confirmation['name']}")
+            st.write(f"**Email:** {confirmation['email']}")
+            st.write(f"**Tickets:** {len(confirmation['ticket_codes'])}")
+            st.write(f"**Payment:** {confirmation['amount']:.2f} by {confirmation['method']}")
+            st.write("**Your ticket code(s):**")
+            for code in confirmation["ticket_codes"]:
+                st.code(code, language=None)
+            if st.button("Make another booking"):
+                st.session_state["confirmation"] = None
+                st.rerun()
         else:
-            with st.form("booking_form"):
-                email = st.text_input("Your customer email")
-                eid = st.selectbox("Event", list(user_event_labels.keys()), format_func=lambda i: user_event_labels[i])
-                seats = st.number_input("Number of seats", min_value=1, value=1, step=1)
-                submitted = st.form_submit_button("Book now")
+            user_events = read_data("SELECT event_id, event_name, event_start_date FROM events ORDER BY event_id")
+            user_event_labels = {e["event_id"]: f"{e['event_name']} ({e['event_start_date']})" for e in user_events}
+            user_methods = {r["payment_method_code"]: r["payment_method_description"] for r in read_data("SELECT payment_method_code, payment_method_description FROM ref_payment_methods ORDER BY payment_method_code")}
 
-            if submitted:
-                # Look up the customer by email so the customer list is never shown to the user
-                found = read_data("SELECT customer_id FROM customers WHERE customer_email = %s", (email.strip(),)) if email.strip() else []
-                if not found:
-                    st.warning("No customer account was found for that email.")
-                else:
-                    # Status starts as PENDING; today's date and the event's start time are filled in automatically
-                    ok = write_data(
-                        "INSERT INTO customer_bookings (customer_id, event_id, booking_status_code, event_datetime, booking_made_date, booking_seat_count) "
-                        "VALUES (%s, %s, 'PENDING', (SELECT event_start_date FROM events WHERE event_id = %s), CURRENT_DATE, %s)",
-                        (found[0]["customer_id"], eid, eid, int(seats)),
-                    )
-                    if ok:
-                        st.success("Booking submitted.")
+            if not user_events:
+                st.info("There are no events available to book yet.")
+            else:
+                with st.form("booking_form"):
+                    st.markdown("**Your details**")
+                    name = st.text_input("Name")
+                    phone = st.text_input("Phone")
+                    email = st.text_input("Email")
+                    address = st.text_input("Address")
+
+                    st.markdown("**Booking**")
+                    eid = st.selectbox("Event", list(user_event_labels.keys()), format_func=lambda i: user_event_labels[i])
+                    tickets = st.number_input("Number of tickets", min_value=1, value=1, step=1)
+
+                    st.markdown("**Payment**")
+                    method = st.selectbox("Payment type", list(user_methods.keys()), format_func=lambda m: user_methods[m])
+                    amount = st.number_input("Payment amount", min_value=0.01, value=10.00, step=1.00, format="%.2f")
+                    reference = st.text_input("Transaction reference (optional)")
+                    submitted = st.form_submit_button("Book now")
+
+                if submitted:
+                    if name.strip() == "" or phone.strip() == "" or email.strip() == "":
+                        st.warning("Name, phone and email are required.")
+                    else:
+                        result = create_booking(
+                            name.strip(), phone.strip(), email.strip(), address.strip(),
+                            eid, int(tickets), method, float(amount), reference.strip(),
+                        )
+                        if result:
+                            st.session_state["confirmation"] = {
+                                "booking_id": result["booking_id"],
+                                "ticket_codes": result["ticket_codes"],
+                                "event": user_event_labels[eid],
+                                "name": name.strip(),
+                                "email": email.strip(),
+                                "method": user_methods[method],
+                                "amount": float(amount),
+                            }
+                            st.rerun()
 
     st.stop()  # stop here so a regular user never reaches the manager code below
 
