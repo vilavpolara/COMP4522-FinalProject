@@ -7,9 +7,10 @@ st.set_page_config(page_title="Event Booking System", layout="wide")
 
 
 # ===================== MANAGER ACCOUNT =====================
-# Customers never log in; only the manager signs in (from the sidebar) to insert, update and delete data
-MANAGER_EMAIL = "manager@example.com"
-MANAGER_PASSWORD = "COMP4522_MANAGER"
+# Customers never log in; only the manager signs in (from the sidebar) to insert, update and delete data.
+# The manager's email and password are kept in .streamlit/secrets.toml (not in GitHub), like the database URL.
+MANAGER_EMAIL = st.secrets["MANAGER_EMAIL"].strip().lower()
+MANAGER_PASSWORD = st.secrets["MANAGER_PASSWORD"]
 
 
 # ===================== DATABASE HELPERS =====================
