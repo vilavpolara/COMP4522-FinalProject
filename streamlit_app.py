@@ -171,15 +171,18 @@ def create_booking(name, phone, email, address, event_id, ticket_count, method):
         cur.execute("SELECT booking_status_code FROM customer_bookings WHERE booking_id = %s", (booking_id,))
         booking_status = cur.fetchone()[0]
 
-        # One ticket per seat; the code is built from the event id, booking id and ticket number
-        ticket_codes = []
-        for n in range(1, ticket_count + 1):
-            code = f"TKT-E{event_id:02d}-B{booking_id:03d}-{n:02d}"  # same pattern as the existing tickets
-            cur.execute(
-                "INSERT INTO tickets (booking_id, ticket_code, ticket_status, ticket_issue_date) VALUES (%s, %s, %s, NOW())",
-                (booking_id, code, TICKET_STATUS),
-            )
-            ticket_codes.append(code)
+        # Card / PayPal / e-Transfer bookings are already CONFIRMED, so trg_booking_status_tickets
+        # has created their tickets. Cash bookings are still PENDING, so the app creates them here.
+        cur.execute("SELECT ticket_code FROM tickets WHERE booking_id = %s ORDER BY ticket_code", (booking_id,))
+        ticket_codes = [row[0] for row in cur.fetchall()]
+        if not ticket_codes:
+            for n in range(1, ticket_count + 1):
+                code = f"TKT-E{event_id:02d}-B{booking_id:03d}-{n:02d}"
+                cur.execute(
+                    "INSERT INTO tickets (booking_id, ticket_code, ticket_status, ticket_issue_date) VALUES (%s, %s, %s, NOW())",
+                    (booking_id, code, TICKET_STATUS),
+                )
+                ticket_codes.append(code)
 
         conn.commit()
         return {
